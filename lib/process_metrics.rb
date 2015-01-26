@@ -13,13 +13,18 @@ module ProcessMetrics
 		set
 	end
 
+	def apply_renames(path)
+		while @renames.has_key? path
+			path = @renames[path]
+		end
+		path
+	end
+
 	def get_module(path)
 		if (defined? @renames) && !((defined? @follow_renames) && (@follow_renames == false))
-			while @renames.has_key? path
-				path = @renames[path]
-			end
+			path = apply_renames(path)
 		end
-		return nil unless (@release_files.include? path) && (@file_filter =~ path)
+		return nil unless (@release_files.include? path) && (@file_filter =~ path) && (!(defined? @file_filter_neg) || (@file_filter_neg =~ path).nil?)
 		@modules_regexp.each do |module_regexp|
 			return module_regexp.to_s if module_regexp =~ path
 		end
@@ -39,20 +44,21 @@ module ProcessMetrics
 		commits_children = Hash.new { |hash, key| hash[key] = Set.new }
 		walker.each do |commit|
 			commit.parents.each do |parent|
-				commits_children[parent] << commit
+				commits_children[parent.oid.to_s] << commit.oid.to_s
 			end
 		end
-		commits_to_visit = [old_commit]
+		commits_to_visit = [old_commit_str]
 		discovered_commits = Set.new
 		result = []
 		while !commits_to_visit.empty?
 			commit = commits_to_visit.pop
 			if (discovered_commits.add?(commit)) && commit != new_commit
-				result << commit
+				result << @repo.lookup(commit)
 				commits_children[commit].each { |child|	commits_to_visit << child }
 			end
 		end
 		result << new_commit
+		puts "num commits #{result.size}"
 		result.reverse
 	end
 
@@ -63,7 +69,7 @@ module ProcessMetrics
 	# @param old_release [String] a string with the OID of the commit in the repository
 	# @return [Hash] a hash with the metrics. The two possible keys are :process_metrics and :module_metrics
 	def extract_metrics(new_release, old_release = nil, extract_code_metrics = false, max_commits = -1)
-		@renames = {}
+		@renames = {} unless defined? @renames
 		contributions = Hash.new { |hash, key| hash[key] = {:touches => 0, :churn => 0} }
 		modules_churn = Hash.new(0)
 		modules_touches = Hash.new(0)
@@ -76,31 +82,47 @@ module ProcessMetrics
 		else
 			walker = get_commits_between(new_release, old_release)
 		end
-
-		num_commit = 1
 		walker.each do |commit|
-			break if max_commits != 1 && num_commit == max_commits
 			next if commit.parents.size != 1 # ignore merges
-			print "#{@source}: extracting commit #{num_commit}: #{commit.oid.to_s}\r"
+			diff = commit.parents[0].diff(commit)
+			diff.find_similar!({:renames => true, :ignore_whitespace => true}) unless (defined? @follow_renames) && (@follow_renames == false)
+			diff.each do |patch|
+				file = patch.delta.new_file[:path]
+				renamed_path = patch.delta.old_file[:path]
+				@renames[renamed_path] = file if (patch.delta.status == :renamed) && !(rename_set(file).include? renamed_path)
+			end
+		end
+		puts "num renames #{@renames.size}"
+		num_commit = 1
+		if old_release.nil?
+			walker = Rugged::Walker.new(@repo)
+			walker.sorting(Rugged::SORT_TOPO)
+			walker.push(new_release)
+		end
+		walker.each do |commit|
+			break if max_commits != -1 && num_commit == max_commits
+			next if commit.parents.size != 1 # ignore merges
 			num_commit = num_commit + 1
 
 			author = commit.author[:name]
 			author = @authors_merge[author] if (defined? @authors_merge) && (@authors_merge.has_key? author)
 
-			diff = commit.parents[0].diff(commit)
-			diff.find_similar!({:renames => true, :ignore_whitespace => true}) unless (defined? @follow_renames) && (@follow_renames == false)
-			diff.each do |patch|
-				file = patch.delta.new_file[:path]
-				maudule = get_module(file)
-				next if maudule.nil?
-				renamed_path = patch.delta.old_file[:path]
-				@renames[renamed_path] = file if (patch.delta.status == :renamed) && !(rename_set(file).include? renamed_path)
+			commit.parents.each do |parent|
+				diff = parent.diff(commit)
+				diff.find_similar!({:renames => true, :ignore_whitespace => true}) unless (defined? @follow_renames) && (@follow_renames == false)
+				diff.each do |patch|
+					file = patch.delta.new_file[:path]
+					maudule = get_module(file)
+					next if maudule.nil?
+					#renamed_path = patch.delta.old_file[:path]
+					#@renames[renamed_path] = file if (patch.delta.status == :renamed) && !(rename_set(file).include? renamed_path)
 
-				modules_churn[maudule] = modules_churn[maudule] + patch.stat[0] + patch.stat[1]
-				modules_touches[maudule] = modules_touches[maudule] + 1
-				modules_authors[maudule] = (modules_authors[maudule] << author)
-				key = {:author => author, :module => maudule}
-				contributions[key] = {:touches => contributions[key][:touches] + 1, :churn => contributions[key][:churn] + patch.stat[0] + patch.stat[1]}
+					modules_churn[maudule] = modules_churn[maudule] + patch.stat[0] + patch.stat[1]
+					modules_touches[maudule] = modules_touches[maudule] + 1
+					modules_authors[maudule] = (modules_authors[maudule] << author)
+					key = {:author => author, :module => maudule}
+					contributions[key] = {:touches => contributions[key][:touches] + 1, :churn => contributions[key][:churn] + patch.stat[0] + patch.stat[1]}
+				end
 			end
 		end
 		release_date = @repo.lookup(new_release).author[:time]
@@ -156,14 +178,18 @@ module ProcessMetrics
 
 	end
 
-	def get_files(commit_oid)
+	def get_files_from_db
 		release_files = Set.new
-		@repo.lookup(commit_oid).tree.walk_blobs do |root, entry|
-			unless @repo.lookup(entry[:oid]).binary?
-				release_files << "#{root}#{entry[:name]}"
-			end
+		cloc_source = @addons[:db].db['cloc-file'].find_one({source: @source})
+		cloc_source["cloc"].each do |cloc_file|
+			release_files << cloc_file["path"]
 		end
 		release_files
+	end
+
+	def get_files(commit_oid)
+		@repo.checkout(commit_oid, {:strategy=>[:force,:remove_untracked]})
+		Dir['./**/*'].map { |e| e.gsub(/^\.\//,'')}
 	end
 
 end
@@ -179,22 +205,47 @@ class ProcessMetricsAnalysis < Diggit::Analysis
 		@file_filter = Regexp.new src_opt["file-filter"]
 		@modules_regexp = []
 		@modules_regexp = src_opt["modules"].map { |m| Regexp.new m } unless src_opt["modules"].nil? || ((@options.has_key? "ignore_modules") && (@options["ignore_modules"] == true))
+		modules_metrics = true
+		modules_metrics = @options["modules_metrics"] if @options.has_key? "modules_metrics"
+		all_releases = false
+		all_releases = @options["all_releases"] if @options.has_key? "all_releases"
 
 
-		@release_files = get_files(@releases[0])
+		@release_files = get_files_from_db
+		process_metrics_coll = "process_metrics_#{all_releases ? 'turnover' : 'own'}_#{'no_' if !@follow_renames}rename"
+		modules_metrics_coll = "modules_metrics_#{'no_' if !@follow_renames}rename" if modules_metrics
 
-		extract_loc
-		extract_bugfixes
-		metrics = extract_metrics(@releases[0], @releases[1], true)
-		binding.pry
-		@addons[:db].db["process_metrics"].insert(metrics[:process_metrics])
-		@addons[:db].db["modules_metrics"].insert(metrics[:module_metrics])
+		extract_loc if modules_metrics
+		extract_bugfixes if modules_metrics
+
+		periods = []
+		if all_releases
+			periods = [[@releases[0], @releases[1]],[@releases[1], @releases[2]]] if @releases.size == 3
+		else
+			periods = [[@releases[0], @releases[1]]]
+		end
+
+		periods.each do |period|
+			metrics = extract_metrics(period[0], period[1], modules_metrics)
+			@addons[:db].db[process_metrics_coll].insert(metrics[:process_metrics])
+			@addons[:db].db[modules_metrics_coll].insert(metrics[:module_metrics]) if modules_metrics
+		end
+
 
 	end
 
 	def clean
-		@addons[:db].db["process_metrics"].remove({project:@source})
-		@addons[:db].db["modules_metrics"].remove({project:@source})
+		modules_metrics = true
+		modules_metrics = @options["modules_metrics"] if @options.has_key? "modules_metrics"
+		all_releases = false
+		all_releases = @options["all_releases"] if @options.has_key? "all_releases"
+		follow_renames = true
+		follow_renames = @options["follow_renames"] if @options.has_key? "follow_renames"
+
+		process_metrics_coll = "process_metrics_#{all_releases ? 'turnover' : 'own'}_#{'no_' if !follow_renames}rename"
+		modules_metrics_coll = "modules_metrics_#{'no_' if !follow_renames}rename" if modules_metrics
+		@addons[:db].db[process_metrics_coll].remove({project:@source})
+		@addons[:db].db[modules_metrics_coll].remove({project:@source}) if modules_metrics
 	end
 end
 
