@@ -1,5 +1,5 @@
 # encoding: utf-8
-require "rinruby"
+
 require_relative "process_metrics"
 
 class RenameImpactOnMetrics < Diggit::Analysis
@@ -50,6 +50,6 @@ end
 class RenameImpactJoin < Diggit::Join
 
 	def run
-		R.eval "source('#{File.expand_path("../rename_join.r", __FILE__)}')"
+		@addons[:R].eval "source('#{File.expand_path("../rename_join.r", __FILE__)}')"
 	end
 end
