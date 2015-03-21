@@ -71,19 +71,19 @@ class AuthorshipAnalysis < Diggit::Analysis
 	def run
 		commits = get_commits_between(@releases[0], @releases[1])
 		walker = Rugged::Walker.new(@repo)
-	    walker.sorting(Rugged::SORT_TOPO)
-	    walker.simplify_first_parent
-	    walker.push(@releases[0])
+		walker.sorting(Rugged::SORT_TOPO)
+		walker.simplify_first_parent
+		walker.push(@releases[0])
 
-	    num_recorded_snapshots = 1
-	    release_commit = @repo.lookup(@releases[0])
+		num_recorded_snapshots = 1
+		release_commit = @repo.lookup(@releases[0])
 		record_modules_authorships(@releases[0])
 	    #last_snapshot_time = release_commit.committer[:time]
 
 	    num_commits_since_last_snapshot = 0
 	    walker.each do |commit|
-    		extract_commit_renames(commit)
-    		num_commits_since_last_snapshot = num_commits_since_last_snapshot + 1
+	    	extract_commit_renames(commit)
+	    	num_commits_since_last_snapshot = num_commits_since_last_snapshot + 1
 	    	if num_commits_since_last_snapshot == 100
 	    		num_commits_since_last_snapshot = 0
 	    		record_modules_authorships(commit.oid.to_s)
